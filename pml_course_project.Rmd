@@ -1,0 +1,189 @@
+---
+title: "Predicting Weight Lifting Exercise Quality"
+author: "Love Vaishnav"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      fig.width = 8, fig.height = 4.8)
+suppressPackageStartupMessages(library(caret))
+suppressPackageStartupMessages(library(randomForest))
+```
+
+## Question and data
+
+The task is to predict **how** a participant performed a barbell lift. The
+outcome `classe` has five categories (A to E). I used the [provided training
+data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) for
+model building and kept the [20-case test
+set](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) for
+the final quiz predictions. The original [Weight Lifting Exercises data
+source](https://web.archive.org/web/20161224072740/http://groupware.les.inf.puc-rio.br/har)
+describes the sensor study.
+
+## Prepare the data
+
+These commands download the CSV files only if they are absent from the current
+project folder. Blank values, `NA`, and `#DIV/0!` are treated as missing.
+
+```{r data}
+train_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url  <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+if (!file.exists("pml-training.csv")) {
+  download.file(train_url, "pml-training.csv", mode = "wb", quiet = TRUE)
+}
+if (!file.exists("pml-testing.csv")) {
+  download.file(test_url, "pml-testing.csv", mode = "wb", quiet = TRUE)
+}
+
+training <- read.csv("pml-training.csv",
+                     na.strings = c("NA", "", "#DIV/0!"))
+testing <- read.csv("pml-testing.csv",
+                    na.strings = c("NA", "", "#DIV/0!"))
+stopifnot("classe" %in% names(training), nrow(testing) == 20)
+training$classe <- factor(training$classe)
+
+# Row identifiers, participant names, dates and window labels are not sensor
+# measurements. Exclude them to avoid learning a shortcut unrelated to motion.
+metadata <- c("X", "user_name", "raw_timestamp_part_1",
+              "raw_timestamp_part_2", "cvtd_timestamp", "new_window",
+              "num_window", "problem_id")
+shared <- setdiff(intersect(names(training), names(testing)), metadata)
+
+# Use only numeric sensor columns that have values in every row of both sets.
+complete_numeric <- function(nm) {
+  is.numeric(training[[nm]]) && is.numeric(testing[[nm]]) &&
+    all(is.finite(training[[nm]])) && all(is.finite(testing[[nm]]))
+}
+predictors <- shared[vapply(shared, complete_numeric, logical(1))]
+stopifnot(length(predictors) > 0)
+
+# Remove constant or nearly constant predictors based on training data only.
+nzv <- caret::nearZeroVar(training[, predictors, drop = FALSE])
+if (length(nzv) > 0) predictors <- predictors[-nzv]
+stopifnot(length(predictors) > 0)
+
+data.frame(training_rows = nrow(training), test_rows = nrow(testing),
+           sensor_predictors = length(predictors))
+```
+
+This leaves `r length(predictors)` complete numeric sensor predictors. I did
+not use the 20 test cases to tune the model or estimate accuracy, because their
+true labels are unavailable.
+
+## Cross validation and model selection
+
+I used a stratified 75% split for model development and reserved 25% as an
+untouched validation set. Within the development set, three-fold cross
+validation compared two values of `mtry`, the number of sensor variables
+considered at each random forest split. Accuracy selected the better value.
+The random seed makes the split and fitting repeatable.
+
+```{r fit, cache=TRUE}
+set.seed(2026)
+development_rows <- caret::createDataPartition(training$classe, p = 0.75,
+                                               list = FALSE)
+development <- training[development_rows, , drop = FALSE]
+validation <- training[-development_rows, , drop = FALSE]
+
+mtry_values <- sort(unique(pmin(length(predictors), c(6L, 12L))))
+folds <- caret::trainControl(method = "cv", number = 3,
+                            allowParallel = FALSE)
+set.seed(2026)
+cv_model <- caret::train(
+  x = development[, predictors, drop = FALSE],
+  y = development$classe,
+  method = "rf",
+  trControl = folds,
+  tuneGrid = data.frame(mtry = mtry_values),
+  metric = "Accuracy",
+  ntree = 150
+)
+
+knitr::kable(cv_model$results[, c("mtry", "Accuracy", "AccuracySD")],
+             digits = 4, caption = "Accuracy across the three folds")
+```
+
+The selected `mtry` is `r cv_model$bestTune$mtry`. The folds estimate model
+performance inside the development set; the separate validation set gives a
+more direct check of the selected model.
+
+## Validation and expected error
+
+```{r validation}
+validation_pred <- predict(cv_model,
+                           newdata = validation[, predictors, drop = FALSE])
+cm <- caret::confusionMatrix(validation_pred, validation$classe)
+accuracy <- unname(cm$overall["Accuracy"])
+error_rate <- 1 - accuracy
+
+knitr::kable(as.data.frame.matrix(cm$table),
+             caption = "Validation confusion matrix: predicted class by actual class")
+data.frame(validation_cases = nrow(validation),
+           accuracy = round(accuracy, 4),
+           estimated_error_rate = round(error_rate, 4))
+```
+
+The model correctly classified `r sum(validation_pred == validation$classe)`
+of `r nrow(validation)` reserved records. Validation accuracy was
+`r sprintf("%.2f%%", 100 * accuracy)`; the estimated out-of-sample error was
+`r sprintf("%.2f%%", 100 * error_rate)`. This estimate applies most directly
+to similar records from this study. Since the same six people can appear in
+both portions of a row-level split, accuracy for entirely new people could
+be lower.
+
+## Final model and 20 quiz answers
+
+With the settings chosen above, I refitted the forest on all labeled rows.
+The 20 test records were used only here, after the validation result was fixed.
+
+```{r final-model}
+set.seed(2026)
+final_model <- randomForest::randomForest(
+  x = training[, predictors, drop = FALSE],
+  y = training$classe,
+  mtry = cv_model$bestTune$mtry,
+  ntree = 150,
+  importance = TRUE
+)
+quiz_prediction <- predict(final_model,
+                           newdata = testing[, predictors, drop = FALSE],
+                           type = "class")
+
+quiz_id <- if ("problem_id" %in% names(testing)) {
+  testing$problem_id
+} else {
+  seq_len(nrow(testing))
+}
+answers <- data.frame(problem_id = quiz_id,
+                      prediction = as.character(quiz_prediction))
+stopifnot(nrow(answers) == 20, all(answers$prediction %in% levels(training$classe)))
+write.csv(answers, "predictions.csv", row.names = FALSE)
+writeLines(answers$prediction, "prediction_answers.txt")
+
+knitr::kable(answers, caption = "Submit these predictions in problem order")
+```
+
+The answers are also saved in `predictions.csv` and, one per line, in
+`prediction_answers.txt` in the project folder. Check the problem number before
+entering each answer in the prediction quiz.
+
+```{r importance, echo=FALSE}
+randomForest::varImpPlot(final_model, n.var = 12,
+                         main = "Most influential sensor measurements")
+```
+
+## Reproduce the analysis
+
+Open this `.Rmd` in RStudio and click **Knit**. Running it again will use the
+same saved CSV files and random seed. Package versions used in this run:
+`caret` `r as.character(packageVersion("caret"))` and `randomForest`
+`r as.character(packageVersion("randomForest"))` on
+`r R.version.string`.
